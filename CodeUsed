@@ -1,0 +1,173 @@
+
+import numpy as np
+import matplotlib.pyplot as plt
+
+# Constants (units: mV, ms, uF/cm^2, mS/cm^2, etc.)
+E_Na = 50.0
+E_K = -77.0
+E_l = -54.402
+gbar_Na = 120.0
+gbar_K = 36.0
+gbar_l = 0.3
+Cm = 1.0
+Vth = -55.0
+kappa = 0.005  # Adjusted for reasonable max firing rate ~500 Hz
+sigma_v = 0.3
+sigma_y = 0.05
+sigma_s = 0.2
+tau_mu = 10.0
+tau_sigma2 = 20.0
+tau_C = 15.0
+
+# Plasticity parameters (arbitrary but small)
+eta = 0.001
+lambda_ = 0.001  # lambda is reserved, use lambda_
+theta = 0.1
+sigma_w = 0.01
+
+def simulate_hybrid_model(N=1, T=1000.0, dt=0.025):
+    """
+    Simulates the hybrid stochastic neural model for N neurons over time T (ms) with time step dt (ms).
+    - For N=1: Single neuron without synaptic interactions.
+    - For N=2: Two neurons with synaptic coupling.
+    - For N>2: General N neurons.
+    """
+    nt = int(T / dt)
+    V_hist = np.zeros((nt, N))
+    spike_hist = np.zeros((nt, N))
+    mu_hist = np.zeros((nt, N))
+
+    # Initialize state variables
+    V = np.full(N, -65.0)
+    m = np.full(N, 0.05)  # Approximate initial values at rest
+    h = np.full(N, 0.6)
+    n = np.full(N, 0.32)
+    mu = np.zeros(N)
+    sigma2 = np.zeros(N)
+    C = np.zeros((N, N))
+    if N > 1:
+        w = np.random.rand(N, N)
+        w[np.eye(N, dtype=bool)] = 0.0
+        w /= np.sum(w, axis=1, keepdims=True)  # Normalize rows to sum to 1
+    else:
+        w = np.zeros((1, 1))
+
+    for it in range(nt):
+        # Record history
+        V_hist[it] = V
+        mu_hist[it] = mu
+
+        # Compute alpha and beta functions for gating variables
+        vm = V
+        alpha_m = 0.1 * (25 - vm) / (np.exp((25 - vm) / 10) - 1)
+        beta_m = 4 * np.exp(-vm / 18)
+        alpha_h = 0.07 * np.exp(-vm / 20)
+        beta_h = 1 / (np.exp((30 - vm) / 10) + 1)
+        alpha_n = 0.01 * (10 - vm) / (np.exp((10 - vm) / 10) - 1)
+        beta_n = 0.125 * np.exp(-vm / 80)
+
+        # Update gating variables with Euler-Maruyama
+        dm = (alpha_m * (1 - m) - beta_m * m) * dt + sigma_y * np.random.randn(N) * np.sqrt(dt)
+        dh = (alpha_h * (1 - h) - beta_h * h) * dt + sigma_y * np.random.randn(N) * np.sqrt(dt)
+        dn = (alpha_n * (1 - n) - beta_n * n) * dt + sigma_y * np.random.randn(N) * np.sqrt(dt)
+        m += dm
+        h += dh
+        n += dn
+
+        # Clamp gating variables to [0, 1]
+        m = np.clip(m, 0, 1)
+        h = np.clip(h, 0, 1)
+        n = np.clip(n, 0, 1)
+
+        # Compute ionic conductances and currents
+        gNa = gbar_Na * m**3 * h
+        gK = gbar_K * n**4
+        gl = gbar_l * np.ones(N)
+        I_ion = gNa * (V - E_Na) + gK * (V - E_K) + gl * (V - E_l)
+
+        # Update membrane potential (continuous part)
+        dV_det = -I_ion / Cm * dt
+        dV_noise_v = (sigma_v / Cm) * np.random.randn(N) * np.sqrt(dt)
+        dV_noise_s = (sigma_s / Cm) * np.random.randn(N) * np.sqrt(dt)
+        V += dV_det + dV_noise_v + dV_noise_s
+
+        # Probabilistic spiking
+        r = kappa * np.maximum(V - Vth, 0)
+        pi = 1 - np.exp(-r)  # Used for statistics (approximates r for small r)
+        prob = 1 - np.exp(-r * dt)  # Probability of spike in dt
+        spikes = np.random.rand(N) < prob
+        spike_hist[it] = spikes
+
+        # Apply synaptic jumps if N > 1 (instantaneous charge injection)
+        if N > 1:
+            for j in range(N):
+                if spikes[j]:
+                    for i in range(N):
+                        if i != j:
+                            V[i] += w[i, j] / Cm
+
+        # Update mean activity, variance
+        dmu = (-mu + pi) * dt / tau_mu
+        mu += dmu
+        dsigma2 = (-sigma2 + (pi - mu)**2) * dt / tau_sigma2
+        sigma2 += dsigma2
+
+        # Update covariance and plasticity if N > 1
+        if N > 1:
+            for i in range(N):
+                for j in range(N):
+                    if i != j:
+                        dC = (-C[i, j] + (pi[i] - mu[i]) * (pi[j] - mu[j])) * dt / tau_C
+                        C[i, j] += dC
+                        # Stochastic synaptic plasticity
+                        dw = eta * (mu[i] * (mu[j] - theta) + lambda_ * C[i, j]) * dt + sigma_w * np.random.randn() * np.sqrt(dt)
+                        w[i, j] += dw
+            # Normalize weights to sum to 1 per row
+            w[np.eye(N, dtype=bool)] = 0.0
+            row_sums = np.sum(w, axis=1, keepdims=True)
+            w = np.where(row_sums > 0, w / row_sums, w)
+
+    # Plot membrane potentials
+    plt.figure(figsize=(10, 5))
+    time = np.arange(nt) * dt
+    for i in range(N):
+        plt.plot(time, V_hist[:, i], label=f'Neuron {i+1}')
+    plt.xlabel('Time (ms)')
+    plt.ylabel('Membrane Potential (mV)')
+    plt.title(f'Membrane Potentials for {N} Neuron(s)')
+    plt.legend()
+    plt.grid(True)
+    plt.show()
+
+    # Plot spike raster
+    plt.figure(figsize=(10, 3))
+    for i in range(N):
+        spike_times = np.where(spike_hist[:, i])[0] * dt
+        plt.plot(spike_times, np.ones_like(spike_times) * (i + 1), '|', markersize=10, label=f'Neuron {i+1}')
+    plt.xlabel('Time (ms)')
+    plt.ylabel('Neuron Index')
+    plt.title(f'Spike Raster for {N} Neuron(s)')
+    plt.ylim(0.5, N + 0.5)
+    plt.grid(True)
+    plt.show()
+
+    # Plot mean activities
+    plt.figure(figsize=(10, 5))
+    for i in range(N):
+        plt.plot(time, mu_hist[:, i], label=f'Neuron {i+1}')
+    plt.xlabel('Time (ms)')
+    plt.ylabel('Mean Activity μ')
+    plt.title(f'Mean Activities for {N} Neuron(s)')
+    plt.legend()
+    plt.grid(True)
+    plt.show()
+
+# Simulations
+print("Simulating 1 Neuron Model")
+simulate_hybrid_model(N=1, T=500.0, dt=0.025)
+
+print("Simulating 2 Neuron Model")
+simulate_hybrid_model(N=2, T=500.0, dt=0.025)
+
+print("Simulating N=5 Neuron Model")
+simulate_hybrid_model(N=5, T=500.0, dt=0.025)
